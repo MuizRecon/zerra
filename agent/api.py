@@ -9,7 +9,7 @@ import asyncio
 import json
 from typing import Any
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
@@ -871,39 +871,52 @@ def export_scan_sarif(scan_id: str):
 # ── Webhooks & Auto-Scan ────────────────────────────
 
 @app.post("/v1/webhooks/github")
-async def github_webhook(request_body: dict):
+async def github_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None),
+):
     """Receive and process GitHub push/PR webhook events with auto-scan."""
+    from agent.webhook_security import verify_github_signature
+
+    body = await request.body()
+    verify_github_signature(body, x_hub_signature_256, strict=True)
+
+    request_body = json.loads(body)
     db = get_db()
     events = parse_webhook("push", request_body)
     results = []
     monitored_repos = db.list_repos()
 
     for event in events:
+        if not event.repo_full_name:
+            continue
         for repo in monitored_repos:
-            if event.repo_full_name in repo["url"] or repo["url"] in event.repo_url:
-                config = ScanConfig(
-                    repo_url=event.repo_url,
-                    branch=event.branch or repo.get("branch", "main"),
-                    commit_sha=event.commit_sha,
-                    mode=ScanMode(repo.get("scan_mode", "standard")),
-                    github_token=repo.get("github_token"),
-                )
-                scan_result = await _scanner.scan_async(config)
-                db.save_scan(scan_result)
-                db.update_repo_last_scan(repo["id"], scan_result.id)
+            stored_full_name = repo["url"].rstrip("/").split("github.com/")[-1].removesuffix(".git")
+            if event.repo_full_name != stored_full_name:
+                continue
+            config = ScanConfig(
+                repo_url=repo["url"],
+                branch=event.branch or repo.get("branch", "main"),
+                commit_sha=event.commit_sha,
+                mode=ScanMode(repo.get("scan_mode", "standard")),
+                github_token=repo.get("github_token"),
+            )
+            scan_result = await _scanner.scan_async(config)
+            db.save_scan(scan_result)
+            db.update_repo_last_scan(repo["id"], scan_result.id)
 
-                try:
-                    _get_notifier().notify_scan_complete(scan_result)
-                except Exception:
-                    pass
+            try:
+                _get_notifier().notify_scan_complete(scan_result)
+            except Exception:
+                pass
 
-                results.append({
-                    "repo": event.repo_full_name,
-                    "scan_id": scan_result.id,
-                    "grade": scan_result.security_score,
-                    "findings": len(scan_result.findings),
-                })
-                break
+            results.append({
+                "repo": event.repo_full_name,
+                "scan_id": scan_result.id,
+                "grade": scan_result.security_score,
+                "findings": len(scan_result.findings),
+            })
+            break
 
     return {"processed": len(results), "results": results}
 
@@ -1216,7 +1229,6 @@ def sandbox_cleanup():
 # Webhook Security (HMAC-verified GitHub webhooks)
 # ──────────────────────────────────────────────────────────
 
-from fastapi import Request
 from agent.webhook_security import verify_github_signature
 
 
@@ -1228,11 +1240,10 @@ async def github_webhook_secure(
 ):
     """HMAC-verified GitHub webhook endpoint.
 
-    Requires GITHUB_WEBHOOK_SECRET env var. Falls back to /v1/webhooks/github
-    if the secret is not configured (permissive dev mode).
+    Requires GITHUB_WEBHOOK_SECRET env var.
     """
     body = await request.body()
-    verify_github_signature(body, x_hub_signature_256, strict=False)
+    verify_github_signature(body, x_hub_signature_256, strict=True)
 
     try:
         import json as _json
@@ -1247,23 +1258,27 @@ async def github_webhook_secure(
     monitored_repos = db.list_repos()
 
     for event in events:
+        if not event.repo_full_name:
+            continue
         for repo in monitored_repos:
-            if event.repo_full_name in repo["url"] or repo["url"] in event.repo_url:
-                config = ScanConfig(
-                    repo_url=event.repo_url,
-                    branch=event.branch or repo.get("branch", "main"),
-                    commit_sha=event.commit_sha,
-                    mode=ScanMode(repo.get("scan_mode", "standard")),
-                    github_token=repo.get("github_token") or vault.get_github_token(repo["url"]),
-                )
-                # Enqueue instead of blocking
-                job = await scan_queue.enqueue(config, repo_id=repo["id"])
-                results.append({
-                    "repo": event.repo_full_name,
-                    "job_id": job.id,
-                    "status": "queued",
-                })
-                break
+            stored_full_name = repo["url"].rstrip("/").split("github.com/")[-1].removesuffix(".git")
+            if event.repo_full_name != stored_full_name:
+                continue
+            config = ScanConfig(
+                repo_url=repo["url"],
+                branch=event.branch or repo.get("branch", "main"),
+                commit_sha=event.commit_sha,
+                mode=ScanMode(repo.get("scan_mode", "standard")),
+                github_token=repo.get("github_token") or vault.get_github_token(repo["url"]),
+            )
+            # Enqueue instead of blocking
+            job = await scan_queue.enqueue(config, repo_id=repo["id"])
+            results.append({
+                "repo": event.repo_full_name,
+                "job_id": job.id,
+                "status": "queued",
+            })
+            break
 
     return {"event": event_type, "processed": len(results), "results": results}
 
@@ -1619,4 +1634,3 @@ async def apply_fix_and_pr(
             "finding_id": finding_id,
             "error": "Fix could not be applied or tests failed after patch",
         }
-
