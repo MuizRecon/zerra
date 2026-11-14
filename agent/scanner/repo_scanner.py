@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from agent.scanner.models import (
     ScanConfig,
@@ -72,11 +73,13 @@ class RepoScanner:
             clone_cmd.extend(["--branch", config.branch])
 
         # Handle authentication
-        if config.github_token and "github.com" in repo_url:
+        parsed_host = urlparse(repo_url).hostname
+        if config.github_token and parsed_host == "github.com":
             # Insert token into URL for private repos
             auth_url = repo_url.replace(
                 "https://github.com",
-                f"https://{config.github_token}@github.com"
+                f"https://{config.github_token}@github.com",
+                1,
             )
             clone_cmd.extend([auth_url, str(clone_dir)])
         else:
@@ -101,8 +104,13 @@ class RepoScanner:
         count = 0
         exclude_set = set(excluded_dirs)
         for dirpath, dirnames, filenames in os.walk(repo_path):
-            dirnames[:] = [d for d in dirnames if d not in exclude_set]
-            count += len(filenames)
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in exclude_set and not (Path(dirpath, d).is_symlink())
+            ]
+            for fname in filenames:
+                if not (Path(dirpath, fname).is_symlink()):
+                    count += 1
         return count
 
     def scan(self, config: ScanConfig) -> ScanResult:
