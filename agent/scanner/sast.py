@@ -211,9 +211,14 @@ def scan_directory_with_rules(
     all_findings: list[Finding] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in exclude_set]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in exclude_set and not (Path(dirpath, d).is_symlink())
+        ]
         for fname in filenames:
             fpath = Path(dirpath) / fname
+            if fpath.is_symlink():
+                continue
             all_findings.extend(
                 scan_file_with_rules(fpath, root, rules, max_file_size_kb=max_file_size_kb)
             )
